@@ -119,7 +119,7 @@ REST Client
 │    → payment.processed   │           │   → ledger.recorded          │
 │                          │           │                              │
 │  amount > €10,000 ──────►│           └──────────────────────────────┘
-│    → payment.failed(DLT) │
+│    → payment.failed (quarantine) │
 └──────────────────────────┘
 ```
 
@@ -302,7 +302,7 @@ The dashboard provides the following observability surfaces:
 | Live Event Feed | SSE push from `DashboardConsumer` | Real-time |
 | Consumer Lag bars | `GET /api/metrics/lag` (AdminClient) | Every 2 seconds |
 | Throughput counter | Producer internal `AtomicLong` | Every 2 seconds |
-| Approved / DLT counters | SSE event count in browser | Real-time |
+| Approved / quarantine counters | SSE event count in browser | Real-time |
 
 <!-- ADD DASHBOARD SCREENSHOT HERE -->
 
