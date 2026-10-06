@@ -372,6 +372,21 @@ The architectural choices documented here — particularly the use of Kafka's lo
 
 ---
 
+## Limits and next steps
+
+**Limits**
+- It is a single-broker demo (`replication.factor=1`), so `acks=all` adds no extra durability here.
+- Fraud and ledger processing are simulated with `Thread.sleep()`, and the fraud rule is an amount threshold; there is no model.
+- There is no persistence, no Transactional Outbox, no authentication and no automated tests.
+- The ~850 msg/s figure is the producer enqueue rate from a local run, not an end-to-end throughput measurement.
+
+**Next steps**
+- Add integration tests (for example with Testcontainers) for ordering and quarantine routing.
+- Add a real dead letter topic with an error handler for processing failures, kept separate from the business-rule quarantine.
+- Run on a three-broker cluster with `replication.factor=3` and measure end-to-end throughput.
+
+---
+
 ## 13. References
 
 [1] Kreps, J., Narkhede, N., Rao, J. (2011). *Kafka: A Distributed Messaging System for Log Processing*. Proceedings of the NetDB Workshop, VLDB.
