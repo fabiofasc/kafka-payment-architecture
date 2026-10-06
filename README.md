@@ -7,7 +7,7 @@ April 2026
 
 ## Abstract
 
-This paper presents the design and implementation of a cloud-native, event-driven payment processing system built on Apache Kafka and Spring Boot 3. The system models a core banking workflow composed of three independent microservices — payment initiation, fraud detection, and ledger recording — communicating exclusively through Kafka topics. The architecture addresses four fundamental requirements of high-throughput financial systems: guaranteed per-account message ordering, exactly-once producer semantics, non-blocking anomaly routing via Dead Letter Topics, and real-time consumer lag observability. A comparative analysis against RabbitMQ is provided to motivate key architectural decisions. Empirical results demonstrate sustained producer throughput exceeding 800 messages per second on commodity hardware, with consumer lag converging to zero under normal operating conditions.
+This paper presents the design and implementation of an event-driven payment processing demo built on Apache Kafka and Spring Boot 3. The system models a core banking workflow composed of three independent microservices — payment initiation, fraud detection, and ledger recording — communicating exclusively through Kafka topics. The demo explores four requirements of financial event streams: per-account message ordering, idempotent producer semantics, non-blocking routing of high-value payments to a quarantine topic, and real-time consumer lag observability. A comparative analysis against RabbitMQ is provided to motivate key architectural decisions. In a local run, the producer enqueued roughly 850 messages per second (single broker, simulated consumers), and consumer lag converged to zero.
 
 ---
 
@@ -19,7 +19,7 @@ This paper presents the design and implementation of a cloud-native, event-drive
 4. [Topic Design and Partitioning Strategy](#4-topic-design-and-partitioning-strategy)
 5. [Producer Guarantees: Idempotence and Durability](#5-producer-guarantees-idempotence-and-durability)
 6. [Consumer Group Topology](#6-consumer-group-topology)
-7. [Dead Letter Topic Pattern](#7-dead-letter-topic-pattern)
+7. [Quarantine Topic Pattern](#7-quarantine-topic-pattern)
 8. [Observability: Consumer Lag as a Bottleneck Indicator](#8-observability-consumer-lag-as-a-bottleneck-indicator)
 9. [Real-Time Dashboard via Server-Sent Events](#9-real-time-dashboard-via-server-sent-events)
 10. [Performance Evaluation](#10-performance-evaluation)
@@ -35,7 +35,7 @@ Digital banking systems face a fundamental tension between consistency and throu
 
 Apache Kafka addresses this tension through the log abstraction: instead of routing messages directly between services, a producer appends events to a durable, partitioned log. Each consumer group reads from that log independently and at its own pace. The log is not emptied after consumption — it persists for a configurable retention period, enabling replay, audit, and decoupled scaling.
 
-This paper documents a production-inspired implementation of such a system. While simplified for clarity (no persistent storage, no authentication), the architectural patterns demonstrated — partitioned ordering, idempotent production, consumer group isolation, Dead Letter Topic routing, and lag-based observability — are directly applicable to production banking environments.
+This paper documents an educational implementation of such a system. It is simplified (no tests, no persistent storage, no authentication, a single broker), and the patterns it demonstrates — partitioned ordering, idempotent production, consumer group isolation, quarantine-topic routing, and lag-based observability — are a starting point, not a production design.
 
 The full source code is available in a private repository. This document serves as the architectural reference for the public showcase.
 
@@ -63,7 +63,7 @@ Kafka models a topic as an ordered, immutable, partitioned log stored on disk. C
 | **Per-entity ordering** | Partition by entity key (e.g. `accountId`) | No native guarantee with concurrent consumers |
 | **Peak throughput** | ~1M msg/s with batching and zero-copy I/O [1] | ~100K–500K msg/s depending on configuration |
 | **Consumer lag visibility** | Native via `AdminClient.listOffsets` | Queue depth only; no per-consumer breakdown |
-| **Exactly-once production** | Native with `enable.idempotence=true` | At-least-once; exactly-once requires app-level keys |
+| **Duplicate-free production** | Idempotent producer (`enable.idempotence=true`) removes producer retry duplicates per partition | At-least-once; deduplication requires app-level keys |
 | **Regulatory audit trail** | Inherent in log retention | Requires external audit sink |
 
 ### 2.3 Why Kafka for Banking
@@ -161,7 +161,7 @@ Payment processing has zero tolerance for duplicate messages. A network fault th
 The producer is configured as follows:
 
 ```java
-config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);  // exactly-once at broker
+config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);  // no duplicates from producer retries
 config.put(ProducerConfig.ACKS_CONFIG, "all");               // wait for all in-sync replicas
 config.put(ProducerConfig.RETRIES_CONFIG, 3);                // retry on transient failure
 config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
@@ -169,7 +169,7 @@ config.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);         // 16KB batch for t
 config.put(ProducerConfig.LINGER_MS_CONFIG, 5);              // 5ms wait to fill batch
 ```
 
-With `enable.idempotence=true`, the Kafka broker assigns each producer a Producer ID (PID) and tracks a sequence number per partition. If a duplicate message arrives (same PID + sequence), the broker silently discards it. This provides exactly-once semantics at the broker level without requiring two-phase commit or application-level deduplication.
+With `enable.idempotence=true`, the Kafka broker assigns each producer a Producer ID (PID) and tracks a sequence number per partition. If a duplicate message arrives (same PID + sequence), the broker silently discards it. This prevents duplicates caused by producer retries within a partition and session. It is not end-to-end exactly-once: there are no Kafka transactions, and the consumers do not deduplicate.
 
 `acks=all` ensures the broker does not acknowledge a write until all in-sync replicas have persisted the message. Combined with `retries=3`, this provides durability against broker failures without compromising the idempotency guarantee.
 
@@ -201,18 +201,18 @@ The two consumers are configured with different processing latencies:
 
 | Service | Simulated latency | Represents |
 |---|---|---|
-| `fraud-detection-service` | 50–150ms | ML fraud model inference |
+| `fraud-detection-service` | 50–150ms | Simulated fraud check (`Thread.sleep`); the rule itself is an amount threshold |
 | `ledger-service` | 80–200ms | Relational database write |
 
 This asymmetry makes `ledger-consumers` the observable bottleneck: under bulk load, its consumer lag grows faster and drains slower than `fraud-consumers`. This behavior is intentionally demonstrable via the dashboard's lag visualization.
 
 ---
 
-## 7. Dead Letter Topic Pattern
+## 7. Quarantine Topic Pattern
 
 Payments exceeding €10,000 are classified as potentially fraudulent and must not be processed by the normal approval flow. However, blocking the consumer thread to handle such cases would reduce throughput for all other payments on the same partition.
 
-The Dead Letter Topic (DLT) pattern resolves this: the fraud consumer publishes the anomalous event to a dedicated topic (`payment.failed`) and returns immediately, allowing the next record to be consumed without delay:
+A quarantine topic resolves this: the fraud consumer publishes the anomalous event to a dedicated topic (`payment.failed`) and returns immediately, allowing the next record to be consumed without delay:
 
 ```java
 if (event.amount().compareTo(FRAUD_THRESHOLD) > 0) {
@@ -224,7 +224,7 @@ if (event.amount().compareTo(FRAUD_THRESHOLD) > 0) {
 }
 ```
 
-The `payment.failed` topic functions as a quarantine zone. In a production system, a separate DLT processor would:
+The `payment.failed` topic functions as a quarantine zone. It receives payments rejected by a business rule, not messages that failed processing, so it is not a dead letter topic in the Spring Kafka sense (no error handler or recoverer is configured). In a production system, a separate processor would:
 - Alert the fraud operations team
 - Trigger a manual review workflow
 - Optionally re-inject the event into `payment.initiated` after manual clearance
@@ -325,11 +325,11 @@ Watch the demo video here:
 
 | Metric | Observed value |
 |---|---|
-| Producer throughput | **~850 msg/s** (400 messages, ~470ms wall time) |
+| Producer enqueue rate | **~850 msg/s** (400 messages, ~470ms wall time; time to hand messages to the async producer, not end-to-end throughput) |
 | `fraud-consumers` peak lag | ~40–60 messages |
 | `ledger-consumers` peak lag | ~120–180 messages |
 | Lag convergence to zero | fraud: ~45s · ledger: ~80s |
-| Fraud detection rate | ~20% of payments (amount > €10,000) routed to DLT |
+| Payments routed to quarantine | amount > €10,000; with the bulk generator's uniform 500–15,500 € amounts, about a third of payments (the ~20% reported earlier was inaccurate) |
 
 ### 10.3 Bottleneck Analysis
 
@@ -364,9 +364,9 @@ Fraud analysis and ledger writes are simulated with `Thread.sleep()`. The perfor
 
 ## 12. Conclusions
 
-This paper presented a Kafka-based microservices architecture for digital banking payment processing, demonstrating six production-grade patterns: partitioned ordering by account ID, idempotent producer configuration, independent consumer group isolation, Dead Letter Topic routing, AdminClient-based lag observability, and real-time SSE-driven dashboard monitoring.
+This paper presented a Kafka-based microservices architecture for digital banking payment processing, demonstrating six Kafka patterns in an educational implementation: partitioned ordering by account ID, idempotent producer configuration, independent consumer group isolation, quarantine-topic routing, AdminClient-based lag observability, and real-time SSE-driven dashboard monitoring.
 
-The experimental results show that the system sustains over 800 messages per second on commodity hardware with predictable lag behaviour under burst load. The intentional processing asymmetry between the fraud and ledger consumers demonstrates that consumer lag is a practical and actionable bottleneck indicator — a metric that directly informs horizontal scaling decisions in production.
+In a local run the producer enqueued about 850 messages per second (single broker, simulated consumers), and lag behaved predictably under burst load; this is an enqueue rate, not an end-to-end throughput. The intentional processing asymmetry between the fraud and ledger consumers demonstrates that consumer lag is a practical and actionable bottleneck indicator — a metric that directly informs horizontal scaling decisions in production.
 
 The architectural choices documented here — particularly the use of Kafka's log model over traditional queue brokers — are motivated by concrete banking requirements: immutable audit trails, replay capability for reconciliation, and the ability to add downstream consumers without modifying existing services. These properties align directly with the regulatory and operational demands of modern digital banking platforms.
 
@@ -388,4 +388,4 @@ The architectural choices documented here — particularly the use of Kafka's lo
 
 ---
 
-*Source code available upon request. Architecture and patterns validated on Apache Kafka 7.5 / Spring Boot 3.2 / Java 25.*
+*Source code available upon request. Architecture and patterns validated on Confluent Platform 7.5 (Kafka, ZooKeeper) / Spring Boot 3.2 / Java 17 (pom); the test environment used JDK 25.0.2.*
